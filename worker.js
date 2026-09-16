@@ -1,4 +1,5 @@
 import { connect } from 'cloudflare:sockets';
+
 /* ─────────────────────────── ثابت‌ها ─────────────────────────── */
 const VERSION = '2.3';
 const WS_PATH = '/ws';
@@ -6,9 +7,10 @@ const KV_CLIENTS = 'vw_clients_v21';
 const TLS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 const ALLOWED_PORTS = [443, 2053, 2083, 2087, 2096, 8443, 80, 8080, 8880, 2052, 2082, 2086, 2095];
 const BG_IMAGE = 'https://z-cdn-media.chatglm.cn/files/d006b6a8-f1de-4a0f-8ba2-0c1c28d9e176.jpg?auth_key=1889289361-5c6ee6159b7b413cbb23f1a2ad42d602-0-49ea3365dc98f9f7159d8410c901ff2d';
+
 /* ─────────────────────────── ابزارهای عمومی ─────────────────────────── */
 function escHtml(s) {
-return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
   });
 }
@@ -142,22 +144,26 @@ async function saveClients(env, clients) {
   await env.KV.put(KV_CLIENTS, JSON.stringify(clients));
 }
 
-/* حافظه‌ی موقتِ سطح ایزوله برای مصرف — نسخه‌ی قبلی این تابع به‌ازای هر اتصال
-   وب‌سوکت (که ممکن است صدها بار در روز رخ دهد) با احتمال ۵٪ مستقیماً در KV
-   می‌نوشت؛ روی پلن رایگان کلودفلر که سقف روزانه معمولاً ۱۰۰۰ نوشتن است، همین
-   نوشتن‌های تصادفیِ پرشمار خیلی زود کل سهمیه را می‌بلعید و باعث می‌شد حتی
-   عملیات‌های مدیریتی ساده مثل «ساخت کلاینت» هم با خطای
-   «KV put() limit exceeded for the day» شکست بخورد.
-   در این نسخه:
-     ۱) هیچ نوشتن تصادفی‌ای وجود ندارد — فقط بر اساس آستانه‌ی حجمی یا زمانی.
-     ۲) وقتی زمان نوشتن برسد، مصرفِ همه‌ی کلاینت‌های در صف با یک put() واحد
-        نوشته می‌شود (نه یک put() جداگانه به‌ازای هر کلاینت).
-     ۳) اگر نوشتن به هر دلیلی (از جمله پر بودن سقف روزانه) شکست بخورد، مقادیر
-        به بافر برمی‌گردند تا در فرصت بعدی دوباره تلاش شود و داده گم نشود. */
+/* ─────────────────────────── بافر مصرف (نسخه‌ی اصلاح‌شده) ─────────────────────────── */
+/* این بخش دو باگ داشت که هر دو اینجا رفع شده‌اند:
+   ۱) وقتی یک اتصال WebSocket بسته می‌شد، «flushUsage(true)» فراخوانی می‌شد اما
+      پارامتر force عملاً نادیده گرفته می‌شد — فقط addUsage صدا زده می‌شد که
+      خودش دوباره همان شرط آستانه‌ی ۵ مگابایت/۲ دقیقه را چک می‌کرد. نتیجه:
+      اگر یک اتصال کوتاه (کمتر از آستانه) بسته می‌شد، مصرفش در بافرِ
+      حافظه‌ای همان ایزوله می‌ماند و چون Cloudflare می‌تواند هر لحظه (به‌خصوص
+      بعد از بی‌کاری) آن ایزوله را از حافظه خارج کند، آن مصرف کلاً گم می‌شد و
+      هرگز در KV نوشته نمی‌شد — همان چیزی که باعث می‌شد «مصرف می‌کنم ولی از
+      حجم کم نمی‌شود».
+   ۲) قفل «flushing» به‌صورت یک boolean ساده بود: اگر یک flush دیگر هم‌زمان
+      در حال اجرا بود، فراخوانی جدید بی‌سروصدا و بدون هیچ تلاش مجددی رد
+      می‌شد؛ این هم می‌توانست مصرفِ بافرشده را گم کند.
+   راه‌حل: flushUsageBuffer اکنون با یک زنجیره‌ی Promise سریالایز می‌شود (هیچ
+   فراخوانی‌ای رد نمی‌شود، فقط صف می‌شود)، و بستن اتصال حالا واقعاً و
+   بدون قید‌وشرط باعث یک نوشتن در KV می‌شود — نه فقط بافر کردن دوباره. */
 const USAGE_BUFFER = globalThis.__vwUsageBuffer || (globalThis.__vwUsageBuffer = {});
-const USAGE_STATE = globalThis.__vwUsageState || (globalThis.__vwUsageState = { lastFlush: 0, flushing: false });
+const USAGE_STATE = globalThis.__vwUsageState || (globalThis.__vwUsageState = { lastFlush: 0, chain: Promise.resolve() });
 const USAGE_FLUSH_THRESHOLD = 5 * 1024 * 1024; // ۵ مگابایت، مجموعِ همه‌ی کلاینت‌های در صف
-const USAGE_FLUSH_INTERVAL_MS = 2 * 60 * 1000; // حداکثر هر ۲ دقیقه یک‌بار نوشتن
+const USAGE_FLUSH_INTERVAL_MS = 2 * 60 * 1000; // حداکثر هر ۲ دقیقه یک‌بار نوشتن (در حالت غیر-اجباری)
 
 function bufferedUsageTotal() {
   let total = 0;
@@ -165,11 +171,9 @@ function bufferedUsageTotal() {
   return total;
 }
 
-async function flushUsageBuffer(env) {
-  if (USAGE_STATE.flushing) return;
+async function doFlushUsageBuffer(env) {
   const pendingIds = Object.keys(USAGE_BUFFER).filter(id => USAGE_BUFFER[id] > 0);
   if (pendingIds.length === 0) { USAGE_STATE.lastFlush = Date.now(); return; }
-  USAGE_STATE.flushing = true;
   const snapshot = {};
   for (const id of pendingIds) { snapshot[id] = USAGE_BUFFER[id]; USAGE_BUFFER[id] = 0; }
   try {
@@ -185,9 +189,18 @@ async function flushUsageBuffer(env) {
     // نوشتن ناموفق بود (مثلاً سقف روزانه‌ی KV پر شده)؛ مقادیر را به بافر
     // برگردان تا در فرصت بعدی دوباره تلاش شود و داده گم نشود
     for (const id in snapshot) USAGE_BUFFER[id] = (USAGE_BUFFER[id] || 0) + snapshot[id];
-  } finally {
-    USAGE_STATE.flushing = false;
   }
+}
+
+function flushUsageBuffer(env) {
+  // همه‌ی فراخوانی‌های flush روی همین ایزوله با یک زنجیره‌ی Promise واحد
+  // سریالایز می‌شوند: هر فراخوانی حتماً بعد از اتمام فراخوانی قبلی اجرا
+  // می‌شود، نه اینکه به‌خاطر «در حال اجرا بودن یکی دیگر» نادیده گرفته شود.
+  USAGE_STATE.chain = USAGE_STATE.chain.then(
+    function () { return doFlushUsageBuffer(env); },
+    function () { return doFlushUsageBuffer(env); }
+  );
+  return USAGE_STATE.chain;
 }
 
 async function addUsage(env, clientId, bytes) {
@@ -292,7 +305,19 @@ async function checkLoginPassword(env, adminPass, input) {
    KV_SETTINGS) دست نمی‌زند؛ فقط بر اساس وجود واقعیِ کلیدهای خیلی قدیمیِ
    بدون‌پسوند تصمیم می‌گیرد که کاملاً idempotent است و به هیچ حافظه‌ی جداگانه‌ای
    نیاز ندارد. */
+/* رفع باگ «هنگ کردن پنل»: این تابع قبلاً روی هر تک درخواست (هر بار باز شدن
+   پنل، هر بار refresh خودکار مصرف هر ۱۵ ثانیه تا ۵ دقیقه، هر کلیک روی هر
+   دکمه‌ای که به /api می‌زند) دو تا KV.get اضافه و کاملاً بی‌فایده انجام
+   می‌داد — برای همیشه، حتی سال‌ها بعد از پاک شدن کلیدهای قدیمی. این یعنی
+   هر درخواست پنل عملاً چند round-trip اضافه به KV می‌زد که با تأخیر شبکه
+   جمع می‌شد و خصوصاً زیر بار refresh خودکار حس «پنل هنگ کرده» را می‌ساخت.
+   حالا این پاک‌سازی فقط یک‌بار در طول عمر هر ایزوله (Worker instance)
+   اجرا می‌شود، با یک پرچم سبک در globalThis — دقیقاً همان الگویی که خود
+   کد برای بافر مصرف استفاده می‌کند. */
+const VW_INIT_STATE = globalThis.__vwInitState || (globalThis.__vwInitState = { done: false });
+
 async function initializeFreshPanel(env) {
+  if (VW_INIT_STATE.done) return;
   if (!env.KV || typeof env.KV.get !== 'function') return;
   try {
     const [legacyClients, legacySettings] = await Promise.all([
@@ -303,6 +328,7 @@ async function initializeFreshPanel(env) {
     if (legacyClients !== null) tasks.push(env.KV.delete('vw_clients'));
     if (legacySettings !== null) tasks.push(env.KV.delete('vw_settings'));
     if (tasks.length) await Promise.all(tasks);
+    VW_INIT_STATE.done = true;
   } catch (e) {}
 }
 
@@ -690,13 +716,27 @@ async function handleProxyWS(request, env, ctx) {
   let closing = false;
   let sessionRef = null;
 
+  /* رفع باگ «مصرف کم نمی‌شود»: قبلاً هنگام بستن اتصال (force=true) واقعاً به
+     KV نوشته نمی‌شد، فقط دوباره بافر می‌شد و اگر ایزوله بین این و آستانه‌ی
+     بعدی (۵MB / ۲دقیقه) از حافظه خارج می‌شد، مصرف کاملاً گم می‌شد. حالا در
+     حالت force، بعد از افزودن به بافر، بدون هیچ شرطی flushUsageBuffer صدا
+     زده می‌شود تا نوشتن واقعی در KV تضمین شود. */
   const flushUsage = (force) => {
-    if (!clientRecord || usage <= reportedUsage) return;
-    const delta = usage - reportedUsage;
-    // فقط اختلافِ جدید را ثبت کن؛ این باعث می‌شود یک اتصال طولانی هم
-    // به‌صورت زنده در سابسکریپشن دیده شود و در close دوباره شمرده نشود.
-    reportedUsage = usage;
-    ctx.waitUntil(addUsage(env, clientRecord.id, delta));
+    if (clientRecord && usage > reportedUsage) {
+      const delta = usage - reportedUsage;
+      // فقط اختلافِ جدید را ثبت کن؛ این باعث می‌شود یک اتصال طولانی هم
+      // به‌صورت زنده در سابسکریپشن دیده شود و در close دوباره شمرده نشود.
+      reportedUsage = usage;
+      USAGE_BUFFER[clientRecord.id] = (USAGE_BUFFER[clientRecord.id] || 0) + delta;
+    }
+    if (force) {
+      // نوشتن واقعی و بدون قید‌وشرط در KV — صرف‌نظر از آستانه‌ی زمانی/حجمی
+      ctx.waitUntil(flushUsageBuffer(env));
+    } else {
+      const dueByTime = (Date.now() - USAGE_STATE.lastFlush) >= USAGE_FLUSH_INTERVAL_MS;
+      const dueBySize = bufferedUsageTotal() >= USAGE_FLUSH_THRESHOLD;
+      if (dueByTime || dueBySize) ctx.waitUntil(flushUsageBuffer(env));
+    }
   };
 
   const scheduleUsageFlush = () => {
@@ -1015,7 +1055,7 @@ async function handleVlessDNSPacket(ws, version, payload) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 function baseCSS() {
-  return`
+  return `
 * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Vazirmatn', Tahoma, sans-serif; }
 :root {
   --bg: #050112;
@@ -1205,8 +1245,9 @@ table.ip-table tr.best td { background: rgba(52, 211, 153, 0.08); }
 .ap-group-label:first-child { margin-top: 0; }
 `;
 }
+
 function particlesJS(id) {
-return`<script>
+  return `<script>
 (function () {
   var c = document.getElementById('${id}');
   if (!c) return;
@@ -1227,9 +1268,10 @@ return`<script>
 })();
 </script>`;
 }
+
 /* ─────────────────────────── صفحه ورود ─────────────────────────── */
 function loginPage() {
-return`<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
@@ -1462,9 +1504,10 @@ body { display: flex; align-items: center; justify-content: center; overflow: hi
 </body>
 </html>`;
 }
+
 /* ─────────────────────────── داشبورد مدیریت ─────────────────────────── */
 function dashboardPage(address) {
-return`<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
@@ -2934,17 +2977,19 @@ select option { background: #120a26; color: #efeafc; }
 </body>
 </html>`;
 }
+
 /* ─────────────────────────── صفحه راه‌اندازی ─────────────────────────── */
 function setupPage(missing) {
-const isKV = missing === 'KV';
-const title = isKV ? '⚠️ KV متصل نیست' : '⚠️ رمز مدیریت تنظیم نشده';
-const desc = isKV
-? 'برای ذخیره کلاینت‌ها و شمارش مصرف، باید یک KV Namespace به این Worker وصل کنید.'
-: 'برای ورود به پنل، متغیر محیطی <b>ADMIN</b> را در تنظیمات Worker تنظیم کنید.';
-const steps = isKV
-? '<li>در کلودفلر به بخش <b>Storage &amp; Databases → KV</b> بروید و یک Namespace بسازید</li><li>در تنظیمات Worker → بخش <b>Bindings</b>، KV را با نام متغیری <b>KV</b> وصل کنید</li><li>ذخیره و Deploy کنید و دوباره این صفحه را باز کنید</li>'
-: '<li>در تنظیمات Worker → بخش <b>Variables and Secrets</b>، متغیری با نام <b>ADMIN</b> بسازید</li><li>مقدار آن را رمز عبور دلخواه پنل قرار دهید</li><li>ذخیره و Deploy کنید و از طریق <b>/login</b> وارد شوید</li>';
-return`<!DOCTYPE html>
+  const isKV = missing === 'KV';
+  const title = isKV ? '⚠️ KV متصل نیست' : '⚠️ رمز مدیریت تنظیم نشده';
+  const desc = isKV
+    ? 'برای ذخیره کلاینت‌ها و شمارش مصرف، باید یک KV Namespace به این Worker وصل کنید.'
+    : 'برای ورود به پنل، متغیر محیطی <b>ADMIN</b> را در تنظیمات Worker تنظیم کنید.';
+  const steps = isKV
+    ? '<li>در کلودفلر به بخش <b>Storage &amp; Databases → KV</b> بروید و یک Namespace بسازید</li><li>در تنظیمات Worker → بخش <b>Bindings</b>، KV را با نام متغیری <b>KV</b> وصل کنید</li><li>ذخیره و Deploy کنید و دوباره این صفحه را باز کنید</li>'
+    : '<li>در تنظیمات Worker → بخش <b>Variables and Secrets</b>، متغیری با نام <b>ADMIN</b> بسازید</li><li>مقدار آن را رمز عبور دلخواه پنل قرار دهید</li><li>ذخیره و Deploy کنید و از طریق <b>/login</b> وارد شوید</li>';
+
+  return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
@@ -2982,9 +3027,10 @@ ol li { margin-bottom: 6px; }
 </body>
 </html>`;
 }
+
 /* ─────────────────────────── صفحه ۴۰۴ جعلی ─────────────────────────── */
 function fakePage() {
-return`<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -3002,9 +3048,10 @@ p { font-size: 14px; }
 </body>
 </html>`;
 }
+
 /* ─────────────────────────── آیکون SVG ─────────────────────────── */
 function faviconSVG() {
-return`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <defs>
 <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
 <stop offset="0" stop-color="#7c3aed"/>
@@ -3015,215 +3062,238 @@ return`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <path d="M36 6 16 36h12l-4 22 24-34H34l2-18z" fill="url(#g)"/>
 </svg>`;
 }
+
 /* ═══════════════════════════════════════════════════════════════════════
-* VODIWALKER — سابسکریپشن یکپارچه (نسخه‌ی تک‌لینکی)
-* این بلوک را عیناً به انتهای فایل Worker خودتان اضافه کنید.
-* (۴ ویرایش کوچک هم در کد فعلی لازم است — در فایل «راهنما.md» توضیح داده شده)
-*
-* یک لینک، دو رفتار:
-* • باز شدن در اپ (v2rayNG / Hiddify / Streisand / …) → خروجی Base64 کانفیگ‌ها
-* • باز شدن در مرورگر → صفحه‌ی گرافیکی Subscription Center
-* آدرس اجباری: ?app=1 (کانفیگ) | ?web=1 (صفحه) | ?stats=1 (JSON زنده)
-* ═══════════════════════════════════════════════════════════════════════ */
+ *  VODIWALKER — سابسکریپشن یکپارچه (نسخه‌ی تک‌لینکی)
+ *  این بلوک را عیناً به انتهای فایل Worker خودتان اضافه کنید.
+ *  (۴ ویرایش کوچک هم در کد فعلی لازم است — در فایل «راهنما.md» توضیح داده شده)
+ *
+ *  یک لینک، دو رفتار:
+ *    • باز شدن در اپ (v2rayNG / Hiddify / Streisand / …) → خروجی Base64 کانفیگ‌ها
+ *    • باز شدن در مرورگر → صفحه‌ی گرافیکی Subscription Center
+ *  آدرس اجباری: ?app=1 (کانفیگ)   |   ?web=1 (صفحه)   |   ?stats=1 (JSON زنده)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
 const SUB_BRAND = 'VodiWalker';
+
 /* ─────────── شمارنده‌ی اتصال‌های زنده (در حافظه‌ی ایزوله، بدون نوشتن در KV) ─────────── */
 const VW_SESSIONS = globalThis.__vwSessions || (globalThis.__vwSessions = new Map());
 let VW_SESSION_SEQ = 0;
+
 function sessionOpen(clientId, request) {
-try {
-if (!clientId) return null;
-let bucket = VW_SESSIONS.get(clientId);
-if (!bucket) { bucket = new Map(); VW_SESSIONS.set(clientId, bucket); }
-const ip = String(request.headers.get('CF-Connecting-IP') || request.headers.get('X-Real-IP') || '?');
-const id = 's' + (++VW_SESSION_SEQ);
-bucket.set(id, { ip: ip, ts: Date.now() });
-return { clientId: clientId, id: id };
-} catch (e) { return null; }
+  try {
+    if (!clientId) return null;
+    let bucket = VW_SESSIONS.get(clientId);
+    if (!bucket) { bucket = new Map(); VW_SESSIONS.set(clientId, bucket); }
+    const ip = String(request.headers.get('CF-Connecting-IP') || request.headers.get('X-Real-IP') || '?');
+    const id = 's' + (++VW_SESSION_SEQ);
+    bucket.set(id, { ip: ip, ts: Date.now() });
+    return { clientId: clientId, id: id };
+  } catch (e) { return null; }
 }
+
 function sessionClose(ref) {
-try {
-if (!ref) return;
-const bucket = VW_SESSIONS.get(ref.clientId);
-if (!bucket) return;
-bucket.delete(ref.id);
-if (bucket.size === 0) VW_SESSIONS.delete(ref.clientId);
-} catch (e) {}
+  try {
+    if (!ref) return;
+    const bucket = VW_SESSIONS.get(ref.clientId);
+    if (!bucket) return;
+    bucket.delete(ref.id);
+    if (bucket.size === 0) VW_SESSIONS.delete(ref.clientId);
+  } catch (e) {}
 }
+
 function sessionStats(clientId) {
-try {
-const bucket = VW_SESSIONS.get(clientId);
-if (!bucket) return { count: 0, ips: 0 };
-const now = Date.now();
-const ips = new Set();
-for (const [k, v] of bucket) {
-if (now - v.ts > 21600000) { bucket.delete(k); continue; } // پاک‌سازی نشست‌های رهاشده (۶ ساعت)
-ips.add(v.ip);
+  try {
+    const bucket = VW_SESSIONS.get(clientId);
+    if (!bucket) return { count: 0, ips: 0 };
+    const now = Date.now();
+    const ips = new Set();
+    for (const [k, v] of bucket) {
+      if (now - v.ts > 21600000) { bucket.delete(k); continue; } // پاک‌سازی نشست‌های رهاشده (۶ ساعت)
+      ips.add(v.ip);
+    }
+    return { count: bucket.size, ips: ips.size };
+  } catch (e) { return { count: 0, ips: 0 }; }
 }
-return { count: bucket.size, ips: ips.size };
-} catch (e) { return { count: 0, ips: 0 }; }
-}
+
 /* ─────────── تشخیص مرورگر در برابر اپ وی‌پی‌ان ─────────── */
+
 /* نمایش صفحه‌ی گرافیکی فقط با درخواست صریح — نه با حدس زدن از روی هدرها.
-لینک /sub/TOKEN که کاربر در اپ وارد می‌کند باید همیشه، با هر هدری و از
-هر کلاینتی، دقیقاً یک رفتار ثابت داشته باشد: کانفیگ خام. هرگونه تشخیص
-خودکارِ «این درخواست از مرورگر است یا اپ» (بر پایه‌ی User-Agent، Accept یا
-Sec-Fetch-Mode) در عمل غیرقابل‌اعتماد است — برخی اپ‌ها (به‌خصوص آن‌هایی که
-از WebView یا موتورهای شبکه‌ای مثل Cronet استفاده می‌کنند) همان هدرهایی را
-می‌فرستند که مرورگرهای واقعی می‌فرستند، و اگر اشتباه به‌عنوان «مرورگر»
-تشخیص داده شوند، به‌جای کانفیگ HTML می‌گیرند و افزودن سابسکریپشن در اپ
-شکست می‌خورد. برای همین صفحه‌ی گرافیکی فقط با پارامتر صریح ?web=1 یا از
-طریق مسیر /info/TOKEN (که همیشه همان ?web=1 را اعمال می‌کند) نمایش داده
-می‌شود؛ لینک خام /sub/TOKEN هرگز، تحت هیچ شرایطی، تغییر رفتار نمی‌دهد. */
+   لینک /sub/TOKEN که کاربر در اپ وارد می‌کند باید همیشه، با هر هدری و از
+   هر کلاینتی، دقیقاً یک رفتار ثابت داشته باشد: کانفیگ خام. هرگونه تشخیص
+   خودکارِ «این درخواست از مرورگر است یا اپ» (بر پایه‌ی User-Agent، Accept یا
+   Sec-Fetch-Mode) در عمل غیرقابل‌اعتماد است — برخی اپ‌ها (به‌خصوص آن‌هایی که
+   از WebView یا موتورهای شبکه‌ای مثل Cronet استفاده می‌کنند) همان هدرهایی را
+   می‌فرستند که مرورگرهای واقعی می‌فرستند، و اگر اشتباه به‌عنوان «مرورگر»
+   تشخیص داده شوند، به‌جای کانفیگ HTML می‌گیرند و افزودن سابسکریپشن در اپ
+   شکست می‌خورد. برای همین صفحه‌ی گرافیکی فقط با پارامتر صریح ?web=1 یا از
+   طریق مسیر /info/TOKEN (که همیشه همان ?web=1 را اعمال می‌کند) نمایش داده
+   می‌شود؛ لینک خام /sub/TOKEN هرگز، تحت هیچ شرایطی، تغییر رفتار نمی‌دهد. */
 function wantsWebPage(url, path) {
-if (path.startsWith('/info/')) return true;
-if (url.searchParams.get('app') === '1') return false;
-return url.searchParams.get('web') === '1';
+  if (path.startsWith('/info/')) return true;
+  if (url.searchParams.get('app') === '1') return false;
+  return url.searchParams.get('web') === '1';
 }
+
 /* ─────────── محاسبه‌ی وضعیت کلاینت ─────────── */
 function subComputeState(client) {
-// مصرفِ بافرشده‌ی همین Worker را هم لحاظ کن تا صفحه‌ی سابسکریپشن در
-// زمان اتصال فعال منتظر flush بعدی KV نماند.
-const liveBuffered = Math.max(0, Math.floor(Number(USAGE_BUFFER[client.id]) || 0));
-const usedBytes = Math.max(0, Math.floor(Number(client.usedBytes) || 0) + liveBuffered);
-const limitBytes = client.limitGB > 0 ? Math.round(client.limitGB * 1073741824) : 0;
-const pct = limitBytes > 0 ? Math.min(100, Math.round((usedBytes / limitBytes) * 1000) / 10) : 0;
-const remaining = limitBytes > 0 ? Math.max(0, limitBytes - usedBytes) : -1;
-const daysLeft = client.expiryDays > 0
-? Math.max(0, Math.ceil((client.createdAt + client.expiryDays * 86400000 - Date.now()) / 86400000))
-: -1;
-const expired = (client.expiryDays > 0 && daysLeft === 0) || (limitBytes > 0 && usedBytes >= limitBytes);
-const status = !client.active ? 'inactive' : (expired ? 'expired' : 'active');
-const expireTs = client.expiryDays > 0
-? Math.floor((client.createdAt + client.expiryDays * 86400000) / 1000)
-: 32503680000;
-return { usedBytes, limitBytes, pct, remaining, daysLeft, status, expireTs };
+  // مصرفِ بافرشده‌ی همین Worker را هم لحاظ کن تا صفحه‌ی سابسکریپشن در
+  // زمان اتصال فعال منتظر flush بعدی KV نماند.
+  const liveBuffered = Math.max(0, Math.floor(Number(USAGE_BUFFER[client.id]) || 0));
+  const usedBytes = Math.max(0, Math.floor(Number(client.usedBytes) || 0) + liveBuffered);
+  const limitBytes = client.limitGB > 0 ? Math.round(client.limitGB * 1073741824) : 0;
+  const pct = limitBytes > 0 ? Math.min(100, Math.round((usedBytes / limitBytes) * 1000) / 10) : 0;
+  const remaining = limitBytes > 0 ? Math.max(0, limitBytes - usedBytes) : -1;
+  const daysLeft = client.expiryDays > 0
+    ? Math.max(0, Math.ceil((client.createdAt + client.expiryDays * 86400000 - Date.now()) / 86400000))
+    : -1;
+  const expired = (client.expiryDays > 0 && daysLeft === 0) || (limitBytes > 0 && usedBytes >= limitBytes);
+  const status = !client.active ? 'inactive' : (expired ? 'expired' : 'active');
+  const expireTs = client.expiryDays > 0
+    ? Math.floor((client.createdAt + client.expiryDays * 86400000) / 1000)
+    : 32503680000;
+  return { usedBytes, limitBytes, pct, remaining, daysLeft, status, expireTs };
 }
+
 /* ═══════════════ هندلر اصلی سابسکریپشن ═══════════════ */
 async function handleSubscription(request, env, url, path) {
-const notFound = () => new Response(fakePage(), { status: 404, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
-const token = String(path.split('/')[2] || '').trim();
-if (!token) return notFound();
-// قبل از تولید سابسکریپشن، مصرف بافرشده همین Worker را ثبت کن تا
-// عددی که اپ می‌گیرد با عدد پنل تا حد ممکن هم‌زمان باشد.
-await flushUsageBuffer(env);
-const clients = await loadClients(env);
-const client = clients.find(c => c.token === token);
-if (!client) return notFound();
-const address = getAddress(env, request, url);
-const settings = await loadSettings(env);
-const hosts = (settings.preferredIPs && settings.preferredIPs.length) ? settings.preferredIPs : [''];
-const st = subComputeState(client);
-const sess = sessionStats(client.id);
-/* ── خروجی JSON زنده برای به‌روزرسانی خودکار صفحه ── */
-if (url.searchParams.get('stats') === '1') {
-return new Response(JSON.stringify({
-ok: true,
-used: st.usedBytes,
-limit: st.limitBytes,
-remaining: st.remaining,
-pct: st.pct,
-daysLeft: st.daysLeft,
-status: st.status,
-sessions: sess.count,
-ips: sess.ips,
-ts: Date.now()
-}), {
-headers: {
-'Content-Type': 'application/json; charset=utf-8',
-'Cache-Control': 'no-store',
-'Access-Control-Allow-Origin': '*'
+  const notFound = () => new Response(fakePage(), { status: 404, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+
+  const token = String(path.split('/')[2] || '').trim();
+  if (!token) return notFound();
+
+  // قبل از تولید سابسکریپشن، مصرف بافرشده همین Worker را ثبت کن تا
+  // عددی که اپ می‌گیرد با عدد پنل تا حد ممکن هم‌زمان باشد.
+  await flushUsageBuffer(env);
+  const clients = await loadClients(env);
+  const client = clients.find(c => c.token === token);
+  if (!client) return notFound();
+
+  const address = getAddress(env, request, url);
+  const settings = await loadSettings(env);
+  const hosts = (settings.preferredIPs && settings.preferredIPs.length) ? settings.preferredIPs : [''];
+  const st = subComputeState(client);
+  const sess = sessionStats(client.id);
+
+  /* ── خروجی JSON زنده برای به‌روزرسانی خودکار صفحه ── */
+  if (url.searchParams.get('stats') === '1') {
+    return new Response(JSON.stringify({
+      ok: true,
+      used: st.usedBytes,
+      limit: st.limitBytes,
+      remaining: st.remaining,
+      pct: st.pct,
+      daysLeft: st.daysLeft,
+      status: st.status,
+      sessions: sess.count,
+      ips: sess.ips,
+      ts: Date.now()
+    }), {
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+
+  /* ── ساخت همه‌ی کانفیگ‌ها (همه‌ی پورت‌ها × همه‌ی آی‌پی‌های فعال) ── */
+  const configs = [];
+  for (const h of hosts) {
+    for (const p of ALLOWED_PORTS) {
+      configs.push({
+        ip: h || null,
+        port: p,
+        tls: TLS_PORTS.indexOf(Number(p)) > -1,
+        link: buildConfigLinkForPort(client, address, p, h)
+      });
+    }
+  }
+  const plain = configs.map(c => c.link).join('\n');
+
+  /* ── مرورگر → صفحه‌ی گرافیکی ── */
+  if (wantsWebPage(url, path)) {
+    return new Response(subPage({
+      client: client,
+      state: st,
+      sess: sess,
+      address: address,
+      token: token,
+      subUrl: url.origin + '/sub/' + token,
+      configs: configs
+    }), { headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
+  }
+
+  /* ── اپ وی‌پی‌ان → خروجی استاندارد Base64 ── */
+  return new Response(strToB64(plain), {
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Profile-Title': 'base64:' + strToB64(SUB_BRAND + ' | ' + client.name),
+      'Subscription-Userinfo': 'upload=0; download=' + st.usedBytes + '; total=' + st.limitBytes + '; expire=' + st.expireTs,
+      'Profile-Update-Interval': '6',
+      'Profile-Web-Page-Url': url.origin + '/sub/' + token + '?web=1',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store'
+    }
+  });
 }
-});
-}
-/* ── ساخت همه‌ی کانفیگ‌ها (همه‌ی پورت‌ها × همه‌ی آی‌پی‌های فعال) ── */
-const configs = [];
-for (const h of hosts) {
-for (const p of ALLOWED_PORTS) {
-configs.push({
-ip: h || null,
-port: p,
-tls: TLS_PORTS.indexOf(Number(p)) > -1,
-link: buildConfigLinkForPort(client, address, p, h)
-});
-}
-}
-const plain = configs.map(c => c.link).join('\n');
-/* ── مرورگر → صفحه‌ی گرافیکی ── */
-if (wantsWebPage(url, path)) {
-return new Response(subPage({
-client: client,
-state: st,
-sess: sess,
-address: address,
-token: token,
-subUrl: url.origin + '/sub/' + token,
-configs: configs
-}), { headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
-}
-/* ── اپ وی‌پی‌ان → خروجی استاندارد Base64 ── */
-return new Response(strToB64(plain), {
-headers: {
-'Content-Type': 'text/plain; charset=utf-8',
-'Profile-Title': 'base64:' + strToB64(SUB_BRAND + ' | ' + client.name),
-'Subscription-Userinfo': 'upload=0; download=' + st.usedBytes + '; total=' + st.limitBytes + '; expire=' + st.expireTs,
-'Profile-Update-Interval': '6',
-'Profile-Web-Page-Url': url.origin + '/sub/' + token + '?web=1',
-'Access-Control-Allow-Origin': '*',
-'Cache-Control': 'no-store'
-}
-});
-}
+
 /* ═══════════════ صفحه‌ی گرافیکی Subscription Center ═══════════════ */
 function subPage(d) {
-const c = d.client, st = d.state;
-const name = escHtml(c.name);
-const initial = escHtml(String(c.name || 'V').trim().charAt(0) || 'V');
-const proto = c.protocol === 'trojan' ? 'TROJAN' : 'VLESS';
-const tlsOn = TLS_PORTS.indexOf(Number(c.port)) > -1;
-const protoLine = proto + ' · WebSocket (ws)' + (tlsOn ? ' · TLS' : '');
-const statusText = st.status === 'active' ? 'فعال' : (st.status === 'inactive' ? 'غیرفعال' : 'منقضی');
-const expiryText = st.daysLeft < 0 ? 'نامحدود' : (st.daysLeft === 0 ? 'پایان‌یافته' : st.daysLeft + ' روز');
-const fmt = (b) => {
-b = Number(b) || 0;
-if (b < 1024) return b + ' B';
-const u = ['KB', 'MB', 'GB', 'TB'];
-let i = -1;
-do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
-return (b >= 100 ? Math.round(b) : b.toFixed(2)) + ' ' + u[i];
-};
-const usedText = fmt(st.usedBytes);
-const limitText = st.limitBytes > 0 ? fmt(st.limitBytes) : 'نامحدود';
-const remainText = st.remaining < 0 ? 'نامحدود' : fmt(st.remaining);
-const groups = {};
-const order = [];
-for (const x of d.configs) {
-const key = x.ip || '__direct__';
-if (!groups[key]) { groups[key] = []; order.push(key); }
-groups[key].push(x);
-}
-const configHtml = order.map(function (key) {
-const label = key === '__direct__' ? '🌐 آدرس مستقیم سرویس' : ('🚀 آی‌پی ' + escHtml(key));
-return '<div class="cfg-group">' + label + '</div>' + groups[key].map(function (x) {
-return '<div class="cfg-row"><span class="cfg-port">:' + x.port + (x.tls ? '<b>TLS</b>' : '') + '</span>' +
-'<input type="text" readonly value="' + escHtml(x.link) + '">' +
-'<button type="button" data-copy="' + escHtml(x.link) + '">کپی</button></div>';
-}).join('');
-}).join('');
-const bootData = {
-token: d.token,
-name: c.name,
-used: st.usedBytes,
-limit: st.limitBytes,
-remaining: st.remaining,
-pct: st.pct,
-daysLeft: st.daysLeft,
-status: st.status,
-sessions: d.sess.count,
-ips: d.sess.ips,
-subUrl: d.subUrl,
-allConfigs: d.configs.map(function (x) { return x.link; }).join('\n')
-};
-return`<!DOCTYPE html>
+  const c = d.client, st = d.state;
+  const name = escHtml(c.name);
+  const initial = escHtml(String(c.name || 'V').trim().charAt(0) || 'V');
+  const proto = c.protocol === 'trojan' ? 'TROJAN' : 'VLESS';
+  const tlsOn = TLS_PORTS.indexOf(Number(c.port)) > -1;
+  const protoLine = proto + ' · WebSocket (ws)' + (tlsOn ? ' · TLS' : '');
+  const statusText = st.status === 'active' ? 'فعال' : (st.status === 'inactive' ? 'غیرفعال' : 'منقضی');
+  const expiryText = st.daysLeft < 0 ? 'نامحدود' : (st.daysLeft === 0 ? 'پایان‌یافته' : st.daysLeft + ' روز');
+
+  const fmt = (b) => {
+    b = Number(b) || 0;
+    if (b < 1024) return b + ' B';
+    const u = ['KB', 'MB', 'GB', 'TB'];
+    let i = -1;
+    do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+    return (b >= 100 ? Math.round(b) : b.toFixed(2)) + ' ' + u[i];
+  };
+
+  const usedText = fmt(st.usedBytes);
+  const limitText = st.limitBytes > 0 ? fmt(st.limitBytes) : 'نامحدود';
+  const remainText = st.remaining < 0 ? 'نامحدود' : fmt(st.remaining);
+
+  const groups = {};
+  const order = [];
+  for (const x of d.configs) {
+    const key = x.ip || '__direct__';
+    if (!groups[key]) { groups[key] = []; order.push(key); }
+    groups[key].push(x);
+  }
+  const configHtml = order.map(function (key) {
+    const label = key === '__direct__' ? '🌐 آدرس مستقیم سرویس' : ('🚀 آی‌پی ' + escHtml(key));
+    return '<div class="cfg-group">' + label + '</div>' + groups[key].map(function (x) {
+      return '<div class="cfg-row"><span class="cfg-port">:' + x.port + (x.tls ? '<b>TLS</b>' : '') + '</span>' +
+        '<input type="text" readonly value="' + escHtml(x.link) + '">' +
+        '<button type="button" data-copy="' + escHtml(x.link) + '">کپی</button></div>';
+    }).join('');
+  }).join('');
+
+  const bootData = {
+    token: d.token,
+    name: c.name,
+    used: st.usedBytes,
+    limit: st.limitBytes,
+    remaining: st.remaining,
+    pct: st.pct,
+    daysLeft: st.daysLeft,
+    status: st.status,
+    sessions: d.sess.count,
+    ips: d.sess.ips,
+    subUrl: d.subUrl,
+    allConfigs: d.configs.map(function (x) { return x.link; }).join('\n')
+  };
+
+  return `<!DOCTYPE html>
 <html lang="fa" dir="rtl" data-theme="dark">
 <head>
 <meta charset="UTF-8">
