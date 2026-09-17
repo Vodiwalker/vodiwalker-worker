@@ -831,7 +831,17 @@ async function handleProxyWS(request, env, ctx) {
       if (parsed.protocol === 'vless' && parsed.port === 53) {
         dnsMode = true;
         dnsVersion = parsed.version;
-        handleVlessDNSPacket(ws, parsed.version, parsed.payload).catch(() => {});
+        // رفع باگ «مصرف DNS شمرده نمی‌شد»: قبلاً handleVlessDNSPacket فراخوانی
+        // می‌شد ولی نتیجه‌اش (تعداد بایت واقعاً مصرف‌شده) هیچ‌وقت به usage
+        // اضافه نمی‌شد؛ برای کاربرهایی که ترافیک DNS زیادی دارند این بخش از
+        // مصرف کلاً گم می‌شد. حالا تابع تعداد بایت را برمی‌گرداند و همینجا
+        // به usage اضافه می‌شود.
+        handleVlessDNSPacket(ws, parsed.version, parsed.payload).then(function (n) {
+          if (n > 0) {
+            usage += n;
+            if (usage - reportedUsage >= 1024 * 1024) flushUsage();
+          }
+        }).catch(() => {});
         return;
       }
       closeAll();
@@ -843,8 +853,6 @@ async function handleProxyWS(request, env, ctx) {
       const socket = connect({ hostname, port }, { allowHalfOpen: false });
       const writer = socket.writable.getWriter();
       if (parsed.payload && parsed.payload.byteLength > 0) {
-        usage += parsed.payload.byteLength;
-        if (usage - reportedUsage >= 1024 * 1024) flushUsage();
         await writer.write(parsed.payload);
       }
       return { socket, writer };
@@ -863,6 +871,17 @@ async function handleProxyWS(request, env, ctx) {
         } catch (e2) { continue; }
       }
       if (!ok) { closeAll(); return; }
+    }
+
+    /* رفع باگ «مصرف دوبار حساب می‌شد»: قبلاً شمارش بایت‌های payload اولیه
+       داخل خود establish انجام می‌شد؛ چون establish هم برای تلاش مستقیم و
+       هم (در صورت شکست) دوباره برای هر ProxyIP صدا زده می‌شود، همان
+       payload اولیه می‌توانست چند بار به usage اضافه شود و عدد مصرف را
+       واقعاً بیشتر از حد نشان دهد. حالا شمارش فقط یک‌بار، بعد از برقراری
+       موفق اتصال (چه مستقیم چه از طریق ProxyIP)، انجام می‌شود. */
+    if (parsed.payload && parsed.payload.byteLength > 0) {
+      usage += parsed.payload.byteLength;
+      if (usage - reportedUsage >= 1024 * 1024) flushUsage();
     }
 
     if (parsed.protocol === 'vless') {
@@ -900,7 +919,12 @@ async function handleProxyWS(request, env, ctx) {
         return;
       }
       if (dnsMode) {
-        handleVlessDNSPacket(ws, dnsVersion, data).catch(() => {});
+        handleVlessDNSPacket(ws, dnsVersion, data).then(function (n) {
+          if (n > 0) {
+            usage += n;
+            if (usage - reportedUsage >= 1024 * 1024) flushUsage();
+          }
+        }).catch(() => {});
         return;
       }
       if (!stream || !streamReady) {
@@ -1026,20 +1050,24 @@ function peekParse(data) {
 }
 
 /* ─────────────────── پاسخ DNS از طریق DoH (فقط VLESS) ─────────────────── */
+/* رفع باگ «مصرف DNS شمرده نمی‌شد»: این تابع اکنون تعداد بایت واقعاً
+   رد و بدل شده (طول payload ورودی + طول پاسخی که به کلاینت فرستاده شد) را
+   برمی‌گرداند تا فراخواننده بتواند آن را به usage اضافه کند. قبلاً این مقدار
+   هیچ‌جا برگردانده نمی‌شد و ترافیک DNS کلاً از مصرف حذف بود. */
 async function handleVlessDNSPacket(ws, version, payload) {
   try {
-    if (!payload || payload.byteLength < 2) return;
+    if (!payload || payload.byteLength < 2) return 0;
     const qLen = (payload[0] << 8) | payload[1];
-    if (qLen <= 0 || payload.byteLength < 2 + qLen) return;
+    if (qLen <= 0 || payload.byteLength < 2 + qLen) return 0;
     const query = payload.subarray(2, 2 + qLen);
     const resp = await fetch('https://1.1.1.1/dns-query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/dns-message' },
       body: query
     });
-    if (!resp.ok) return;
+    if (!resp.ok) return 0;
     const answer = new Uint8Array(await resp.arrayBuffer());
-    if (answer.byteLength === 0) return;
+    if (answer.byteLength === 0) return 0;
     const out = new Uint8Array(4 + answer.byteLength);
     out[0] = version;
     out[1] = 0;
@@ -1047,7 +1075,8 @@ async function handleVlessDNSPacket(ws, version, payload) {
     out[3] = answer.byteLength & 0xff;
     out.set(answer, 4);
     ws.send(out);
-  } catch (e) {}
+    return payload.byteLength + out.byteLength;
+  } catch (e) { return 0; }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
