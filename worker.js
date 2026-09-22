@@ -255,7 +255,12 @@ async function loadSettings(env) {
     const raw = await env.KV.get(KV_SETTINGS);
     if (!raw) return defaultSettings();
     const s = JSON.parse(raw);
-    const merged = Object.assign(defaultSettings(), s && typeof s === 'object' ? s : {});
+    const merged = defaultSettings();
+    if (s && typeof s === 'object') {
+      for (const k of Object.keys(merged)) {
+        if (Object.prototype.hasOwnProperty.call(s, k)) merged[k] = s[k];
+      }
+    }
     // سازگاری با نسخه‌های قبلی که فقط یک preferredIP تکی (رشته) ذخیره می‌کردند
     if (!Array.isArray(merged.preferredIPs)) merged.preferredIPs = [];
     if (merged.preferredIP && !merged.preferredIPs.length) {
@@ -360,16 +365,24 @@ export default {
       /* ── ورود ── */
       if (path === '/login') {
         if (request.method === 'POST') {
+          const loginIp = String(request.headers.get('CF-Connecting-IP') || request.headers.get('X-Real-IP') || '?');
+          const rlKey = 'vw_rl_login::' + loginIp;
+          const rlFails = parseInt((await env.KV.get(rlKey)) || '0', 10);
+          if (rlFails >= 5) {
+            return new Response(JSON.stringify({ ok: false, error: 'تلاش‌های ناموفق زیاد است، بعداً دوباره تلاش کنید' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+          }
           const params = new URLSearchParams(await request.text());
           const pass = String(params.get('password') || '');
           const remember = params.get('remember') === '1';
           if (await checkLoginPassword(env, adminPass, pass)) {
+            if (rlFails) await env.KV.delete(rlKey);
             const secretHash = await effectiveAdminHash(env, adminPass);
             const maxAge = remember ? 2592000 : 86400;
             const res = new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
             res.headers.append('Set-Cookie', 'vw_auth=' + (await sha256hex('vw-session::' + secretHash)) + '; Path=/; Max-Age=' + maxAge + '; HttpOnly; SameSite=Strict');
             return res;
           }
+          await env.KV.put(rlKey, String(rlFails + 1), { expirationTtl: 900 });
           return new Response(JSON.stringify({ ok: false, error: 'رمز عبور نادرست است' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
         }
         if (authed) return new Response(null, { status: 302, headers: { Location: url.origin + '/admin' } });
